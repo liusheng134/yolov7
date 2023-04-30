@@ -18,6 +18,7 @@ import torch.utils.data
 import yaml
 from torch.cuda import amp
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
@@ -187,15 +188,6 @@ def train(hyp, opt, device, tb_writer=None):
     logger.info('Optimizer groups: %g .bias, %g conv.weight, %g other' % (len(pg2), len(pg1), len(pg0)))
     del pg0, pg1, pg2
 
-    # Scheduler https://arxiv.org/pdf/1812.01187.pdf
-    # https://pytorch.org/docs/stable/_modules/torch/optim/lr_scheduler.html#OneCycleLR
-    if opt.linear_lr:
-        lf = lambda x: (1 - x / (epochs - 1)) * (1.0 - hyp['lrf']) + hyp['lrf']  # linear
-    else:
-        lf = one_cycle(1, hyp['lrf'], epochs)  # cosine 1->hyp['lrf']
-    scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
-    # plot_lr_scheduler(optimizer, scheduler, epochs)
-
     # EMA
     ema = ModelEMA(model) if rank in [-1, 0] else None
 
@@ -271,6 +263,21 @@ def train(hyp, opt, device, tb_writer=None):
             if not opt.noautoanchor:
                 check_anchors(dataset, model=model, thr=hyp['anchor_t'], imgsz=imgsz)
             model.half().float()  # pre-reduce anchor precision
+
+    # Scheduler https://arxiv.org/pdf/1812.01187.pdf
+    # https://pytorch.org/docs/stable/_modules/torch/optim/lr_scheduler.html#OneCycleLR
+    total_steps = epochs * nb
+    if opt.scheduler == 'linear':
+        lf = lambda x: (1 - x / (epochs - 1)) * (1.0 - hyp['lrf']) + hyp['lrf']  # linear
+        scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
+    elif opt.scheduler == 'onecycle':
+        lf = one_cycle(1, hyp['lrf'], total_steps, 1 if opt.update_by_step else nb)  # cosine 1->hyp['lrf']
+        scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
+    elif opt.scheduler == 'onecycle':
+        scheduler = CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=hyp['lr_max'])
+
+    # from utils.plots import plot_lr_scheduler
+    # plot_lr_scheduler(optimizer, scheduler, total_steps, opt.scheduler)
 
     # DDP mode
     if cuda and rank != -1:
@@ -554,7 +561,10 @@ if __name__ == '__main__':
     parser.add_argument('--name', default='exp', help='save to project/name')
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
     parser.add_argument('--quad', action='store_true', help='quad dataloader')
-    parser.add_argument('--linear-lr', action='store_true', help='linear LR')
+    #scheduler
+    parser.add_argument('--scheduler', type=str, choices=['linear', 'cosin', 'onecycle'], help='LR scheduler')
+    parser.add_argument('--update_by_step', action='store_true', help='update lr every step')
+    
     parser.add_argument('--label-smoothing', type=float, default=0.0, help='Label smoothing epsilon')
     parser.add_argument('--upload_dataset', action='store_true', help='Upload dataset as W&B artifact table')
     parser.add_argument('--bbox_interval', type=int, default=-1, help='Set bounding-box image logging interval for W&B')

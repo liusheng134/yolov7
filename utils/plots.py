@@ -190,20 +190,22 @@ def plot_images(images, targets, paths=None, fname='images.jpg', names=None, max
     return mosaic
 
 
-def plot_lr_scheduler(optimizer, scheduler, epochs=300, save_dir=''):
+def plot_lr_scheduler(optimizer, scheduler, epochs=300, name='', save_dir=''):
     # Plot LR simulating training for full epochs
     optimizer, scheduler = copy(optimizer), copy(scheduler)  # do not modify originals
     y = []
-    for _ in range(epochs):
-        scheduler.step()
-        y.append(optimizer.param_groups[0]['lr'])
+    with open('lr.txt', 'w') as f:
+        for _ in range(epochs):
+            scheduler.step()
+            y.append(optimizer.param_groups[0]['lr'])
+            f.write(str(optimizer.param_groups[0]['lr']) + '\r\n')
     plt.plot(y, '.-', label='LR')
     plt.xlabel('epoch')
     plt.ylabel('LR')
     plt.grid()
     plt.xlim(0, epochs)
     plt.ylim(0)
-    plt.savefig(Path(save_dir) / 'LR.png', dpi=200)
+    plt.savefig(Path(save_dir) / '{}_LR.png'.format(name), dpi=200)
     plt.close()
 
 
