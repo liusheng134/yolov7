@@ -4,6 +4,7 @@ import math
 import os
 import random
 import time
+import shutil
 from copy import deepcopy
 from pathlib import Path
 from threading import Thread
@@ -35,14 +36,34 @@ from utils.loss import ComputeLoss, ComputeLossOTA
 from utils.plots import plot_images, plot_labels, plot_results, plot_evolution
 from utils.torch_utils import ModelEMA, select_device, intersect_dicts, torch_distributed_zero_first, is_parallel
 from utils.wandb_logging.wandb_utils import WandbLogger, check_wandb_resume
+from utils.cosine_scheduler import warm_up_cosine_lr_scheduler
 
 logger = logging.getLogger(__name__)
+
+
+def file_handler(file_name, formats):
+    file_handler = logging.FileHandler(filename=file_name, encoding='utf-8', mode='w')
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(formats)
+    return file_handler
 
 
 def train(hyp, opt, device, tb_writer=None):
     logger.info(colorstr('hyperparameters: ') + ', '.join(f'{k}={v}' for k, v in hyp.items()))
     save_dir, epochs, batch_size, total_batch_size, weights, rank, freeze = \
         Path(opt.save_dir), opt.epochs, opt.batch_size, opt.total_batch_size, opt.weights, opt.global_rank, opt.freeze
+
+    # copy代码到output目录
+    shutil.copytree('./models', opt.save_dir + '/models', dirs_exist_ok=True)
+    shutil.copytree('./utils', opt.save_dir + '/utils', dirs_exist_ok=True)
+    shutil.copy('./train.py', opt.save_dir + '/train.py')
+
+    # logger
+    logger_format = '%(asctime)s - %(filename)s - %(lineno)d - %(levelname)s -%(threadName)s - %(message)s'
+    formats = logging.Formatter(logger_format)
+    file_name = os.path.join(save_dir, '{}.log'.format('logger'))
+    fh = file_handler(file_name, formats)
+    logger.addHandler(fh)
 
     # Directories
     wdir = save_dir / 'weights'
@@ -254,10 +275,10 @@ def train(hyp, opt, device, tb_writer=None):
             c = torch.tensor(labels[:, 0])  # classes
             # cf = torch.bincount(c.long(), minlength=nc) + 1.  # frequency
             # model._initialize_biases(cf.to(device))
-            if plots:
-                #plot_labels(labels, names, save_dir, loggers)
-                if tb_writer:
-                    tb_writer.add_histogram('classes', c, 0)
+            # if plots:
+            #     #plot_labels(labels, names, save_dir, loggers)
+            #     if tb_writer:
+            #         tb_writer.add_histogram('classes', c, 0)
 
             # Anchors
             if not opt.noautoanchor:
@@ -267,17 +288,22 @@ def train(hyp, opt, device, tb_writer=None):
     # Scheduler https://arxiv.org/pdf/1812.01187.pdf
     # https://pytorch.org/docs/stable/_modules/torch/optim/lr_scheduler.html#OneCycleLR
     total_steps = epochs * nb
+
+    # nw = max(round(hyp['warmup_epochs'] * nb), 1000)  # number of warmup iterations, max(3 epochs, 1k iterations)
+    nw = round(hyp['warmup_epochs'] * nb)
+
     if opt.scheduler == 'linear':
         lf = lambda x: (1 - x / (epochs - 1)) * (1.0 - hyp['lrf']) + hyp['lrf']  # linear
         scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
     elif opt.scheduler == 'onecycle':
         lf = one_cycle(1, hyp['lrf'], total_steps, 1 if opt.update_by_step else nb)  # cosine 1->hyp['lrf']
         scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
-    elif opt.scheduler == 'onecycle':
-        scheduler = CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=hyp['lr_max'])
+    elif opt.scheduler == 'cosine':
+        # scheduler = CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=hyp['lr_min'])
+        scheduler = warm_up_cosine_lr_scheduler(optimizer, steps=total_steps, warm_up_steps=nw, eta_min=hyp['lr_min'], lrf=hyp['lrf'])
 
-    # from utils.plots import plot_lr_scheduler
-    # plot_lr_scheduler(optimizer, scheduler, total_steps, opt.scheduler)
+    from utils.plots import plot_lr_scheduler
+    plot_lr_scheduler(optimizer, scheduler, total_steps, opt.scheduler, save_dir=save_dir)
 
     # DDP mode
     if cuda and rank != -1:
@@ -298,7 +324,6 @@ def train(hyp, opt, device, tb_writer=None):
 
     # Start training
     t0 = time.time()
-    nw = max(round(hyp['warmup_epochs'] * nb), 1000)  # number of warmup iterations, max(3 epochs, 1k iterations)
     # nw = min(nw, (epochs - start_epoch) / 2 * nb)  # limit warmup to < 1/2 of training
     maps = np.zeros(nc)  # mAP per class
     results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
@@ -336,7 +361,7 @@ def train(hyp, opt, device, tb_writer=None):
         if rank != -1:
             dataloader.sampler.set_epoch(epoch)
         pbar = enumerate(dataloader)
-        logger.info(('\n' + '%10s' * 8) % ('Epoch', 'gpu_mem', 'box', 'obj', 'cls', 'total', 'labels', 'img_size'))
+        logger.info(('\n' + '%10s' * 9) % ('Epoch', 'gpu_mem', 'box', 'obj', 'cls', 'total', 'labels', 'img_size', 'lr'))
         if rank in [-1, 0]:
             pbar = tqdm(pbar, total=nb)  # progress bar
         optimizer.zero_grad()
@@ -346,14 +371,24 @@ def train(hyp, opt, device, tb_writer=None):
 
             # Warmup
             if ni <= nw:
-                xi = [0, nw]  # x interp
-                # model.gr = np.interp(ni, xi, [0.0, 1.0])  # iou loss ratio (obj_loss = 1.0 or iou)
-                accumulate = max(1, np.interp(ni, xi, [1, nbs / total_batch_size]).round())
-                for j, x in enumerate(optimizer.param_groups):
-                    # bias lr falls from 0.1 to lr0, all other lrs rise from 0.0 to lr0
-                    x['lr'] = np.interp(ni, xi, [hyp['warmup_bias_lr'] if j == 2 else 0.0, x['initial_lr'] * lf(epoch)])
-                    if 'momentum' in x:
-                        x['momentum'] = np.interp(ni, xi, [hyp['warmup_momentum'], hyp['momentum']])
+                if opt.scheduler == 'onecycle':
+                    xi = [0, nw]  # x interp
+                    # model.gr = np.interp(ni, xi, [0.0, 1.0])  # iou loss ratio (obj_loss = 1.0 or iou)
+                    accumulate = max(1, np.interp(ni, xi, [1, nbs / total_batch_size]).round())
+                    for j, x in enumerate(optimizer.param_groups):
+                        # bias lr falls from 0.1 to lr0, all other lrs rise from 0.0 to lr0
+                        x['lr'] = np.interp(ni, xi, [hyp['warmup_bias_lr'] if j == 2 else 0.0, x['initial_lr'] * lf(epoch)])
+                        if 'momentum' in x:
+                            x['momentum'] = np.interp(ni, xi, [hyp['warmup_momentum'], hyp['momentum']])
+                elif opt.scheduler == 'cosine':
+                    xi = [0, nw]  # x interp
+                    # model.gr = np.interp(ni, xi, [0.0, 1.0])  # iou loss ratio (obj_loss = 1.0 or iou)
+                    accumulate = max(1, np.interp(ni, xi, [1, nbs / total_batch_size]).round())
+                    for j, x in enumerate(optimizer.param_groups):
+                        # bias lr falls from 0.1 to lr0, all other lrs rise from 0.0 to lr0
+                        # x['lr'] = np.interp(ni, xi, [hyp['warmup_bias_lr'] if j == 2 else 0.0, x['initial_lr'] * lf(epoch)])
+                        if 'momentum' in x:
+                            x['momentum'] = np.interp(ni, xi, [hyp['warmup_momentum'], hyp['momentum']])
 
             # Multi-scale
             if opt.multi_scale:
@@ -385,14 +420,19 @@ def train(hyp, opt, device, tb_writer=None):
                 optimizer.zero_grad()
                 if ema:
                     ema.update(model)
+            # Scheduler
+            scheduler.step()
 
             # Print
             if rank in [-1, 0]:
                 mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
                 mem = '%.3gG' % (torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0)  # (GB)
-                s = ('%10s' * 2 + '%10.4g' * 6) % (
-                    '%g/%g' % (epoch, epochs - 1), mem, *mloss, targets.shape[0], imgs.shape[-1])
+                s = ('%10s' * 2 + '%10.4g' * 7) % (
+                    '%g/%g' % (epoch, epochs - 1), mem, *mloss, targets.shape[0], imgs.shape[-1], optimizer.param_groups[0]['lr'])
                 pbar.set_description(s)
+
+                if ni % opt.log_steps == 0:
+                    logger.info(s)
 
                 # Plot
                 if plots and ni < 10:
@@ -410,10 +450,9 @@ def train(hyp, opt, device, tb_writer=None):
 
         # Scheduler
         lr = [x['lr'] for x in optimizer.param_groups]  # for tensorboard
-        scheduler.step()
 
         # DDP process 0 or single-GPU
-        if rank in [-1, 0]:
+        if (rank in [-1, 0]) and ((epoch % opt.test_epochs) == 0):
             # mAP
             ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'gr', 'names', 'stride', 'class_weights'])
             final_epoch = epoch + 1 == epochs
@@ -561,10 +600,7 @@ if __name__ == '__main__':
     parser.add_argument('--name', default='exp', help='save to project/name')
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
     parser.add_argument('--quad', action='store_true', help='quad dataloader')
-    #scheduler
-    parser.add_argument('--scheduler', type=str, choices=['linear', 'cosin', 'onecycle'], help='LR scheduler')
-    parser.add_argument('--update_by_step', action='store_true', help='update lr every step')
-    
+
     parser.add_argument('--label-smoothing', type=float, default=0.0, help='Label smoothing epsilon')
     parser.add_argument('--upload_dataset', action='store_true', help='Upload dataset as W&B artifact table')
     parser.add_argument('--bbox_interval', type=int, default=-1, help='Set bounding-box image logging interval for W&B')
@@ -572,6 +608,13 @@ if __name__ == '__main__':
     parser.add_argument('--artifact_alias', type=str, default="latest", help='version of dataset artifact to be used')
     parser.add_argument('--freeze', nargs='+', type=int, default=[0], help='Freeze layers: backbone of yolov7=50, first3=0 1 2')
     parser.add_argument('--v5-metric', action='store_true', help='assume maximum recall as 1.0 in AP calculation')
+    #scheduler
+    parser.add_argument('--scheduler', type=str, choices=['linear', 'cosine', 'onecycle'], help='LR scheduler')
+    parser.add_argument('--update_by_step', action='store_true', help='update lr every step')
+    # eval epochs
+    parser.add_argument('--test_epochs', type=int, default=1, help='cal map between {test_epochs} epochs')
+    # log_steps
+    parser.add_argument('--log_steps', type=int, default=50, help='logging between every {log_steps} steps')
     opt = parser.parse_args()
 
     # Set DDP variables
