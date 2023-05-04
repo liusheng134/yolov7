@@ -3,13 +3,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import sys, os
-sys.path.append('{}/..'.format(os.path.dirname(os.path.abspath(__file__))))
 
 from utils.general import bbox_iou, bbox_alpha_iou, box_iou, box_giou, box_diou, box_ciou, xywh2xyxy, xyxy2xywh
 from utils.torch_utils import is_parallel
-# from general import bbox_iou, bbox_alpha_iou, box_iou, box_giou, box_diou, box_ciou, xywh2xyxy
-# from torch_utils import is_parallel
 
 
 def smooth_BCE(eps=0.1):  # https://github.com/ultralytics/yolov3/issues/238#issuecomment-598028441
@@ -1718,34 +1714,3 @@ class ComputeLossAuxOTA:
             anch.append(anchors[a])  # anchors
 
         return indices, anch
-
-
-if __name__ == '__main__':
-    import pickle
-    import yaml
-    from models.yolo import Model
-    with open('p0.pickle', 'rb') as file:
-        p0 = torch.from_numpy(pickle.load(file))
-    with open('p1.pickle', 'rb') as file:
-        p1 = torch.from_numpy(pickle.load(file))
-    with open('p2.pickle', 'rb') as file:
-        p2 = torch.from_numpy(pickle.load(file))
-    with open('imgs.pickle', 'rb') as file:
-        imgs = torch.from_numpy(pickle.load(file))
-    with open('target.pickle', 'rb') as file:
-        targets = torch.from_numpy(pickle.load(file))
-    
-    p = [p0, p1, p2]
-    with open('data/hyp.scratch.p5.yaml') as f:
-        hyp = yaml.load(f, Loader=yaml.SafeLoader)  # load hyps
-    model = Model('cfg/training/yolov7-tiny.yaml', ch=3, nc=80, anchors=None)  # create
-
-    hyp['box'] *= 3. / 3  # scale to layers
-    hyp['cls'] *= 80 / 80. * 3. / 3  # scale to classes and layers
-    hyp['obj'] *= (640 / 640) ** 2 * 3. / 3  # scale to image size and layers
-    model.hyp = hyp  # attach hyperparameters to model
-    model.gr = 1.0  # iou loss ratio (obj_loss = 1.0 or iou)
-
-    compute_loss_ota = ComputeLossOTA(model)  # init loss class
-    # compute_loss_ota.build_targets(p, targets, imgs)
-    compute_loss_ota(p, targets, imgs)
