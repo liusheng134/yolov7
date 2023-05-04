@@ -3,9 +3,13 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import sys, os
+sys.path.append('{}/..'.format(os.path.dirname(os.path.abspath(__file__))))
 
-from utils.general import bbox_iou, bbox_alpha_iou, box_iou, box_giou, box_diou, box_ciou, xywh2xyxy
+from utils.general import bbox_iou, bbox_alpha_iou, box_iou, box_giou, box_diou, box_ciou, xywh2xyxy, xyxy2xywh
 from utils.torch_utils import is_parallel
+# from general import bbox_iou, bbox_alpha_iou, box_iou, box_giou, box_diou, box_ciou, xywh2xyxy
+# from torch_utils import is_parallel
 
 
 def smooth_BCE(eps=0.1):  # https://github.com/ultralytics/yolov3/issues/238#issuecomment-598028441
@@ -711,6 +715,23 @@ class ComputeLossOTA:
             pair_wise_iou = box_iou(txyxy, pxyxys)
 
             pair_wise_iou_loss = -torch.log(pair_wise_iou + 1e-8)
+            # txywhs = xyxy2xywh(txyxy)[:, None, :].repeat([1, pxyxys.shape[0], 1])
+            # pxywhs = xyxy2xywh(pxyxys)[None, :].repeat([txyxy.shape[0], 1, 1])
+            # t_areas = txywhs[:, :, 2] * txywhs[:, :, 3]
+            # p_areas = pxywhs[:, :, 2] * pxywhs[:, :, 3]
+            # r = p_areas / t_areas
+            # pair_wise_areas_loss = torch.log(torch.max(r, 1. / r))
+
+            txywhs = xyxy2xywh(txyxy)[:, None, :].repeat([1, pxyxys.shape[0], 1])
+            pxywhs = xyxy2xywh(pxyxys)[None, :].repeat([txyxy.shape[0], 1, 1])
+            r = txywhs[:, :, 2:] / pxywhs[:, :, 2:]
+            pair_wise_wh_ration_loss = torch.log(torch.max(r, 1. / r).max(2)[0])
+
+            # delta_x = (txywhs[:, :, 0] - pxywhs[:, :, 0]) * (txywhs[:, :, 0] - pxywhs[:, :, 0])
+            # delta_y = (txywhs[:, :, 1] - pxywhs[:, :, 1]) * (txywhs[:, :, 1] - pxywhs[:, :, 1])
+            # center_distance = torch.sqrt(delta_x + delta_y)
+            # stride_tensor = stride_tensor[from_which_layer.long()]
+            # center_distance = center_distance / stride_tensor
 
             top_k, _ = torch.topk(pair_wise_iou, min(10, pair_wise_iou.shape[1]), dim=1)
             dynamic_ks = torch.clamp(top_k.sum(1).int(), min=1)
@@ -736,6 +757,7 @@ class ComputeLossOTA:
         
             cost = (
                 pair_wise_cls_loss
+                + pair_wise_wh_ration_loss
                 + 3.0 * pair_wise_iou_loss
             )
 
@@ -790,7 +812,7 @@ class ComputeLossOTA:
                 matching_targets[i] = torch.tensor([], device='cuda:0', dtype=torch.int64)
                 matching_anchs[i] = torch.tensor([], device='cuda:0', dtype=torch.int64)
 
-        return matching_bs, matching_as, matching_gjs, matching_gis, matching_targets, matching_anchs           
+        return matching_bs, matching_as, matching_gjs, matching_gis, matching_targets, matching_anchs   
 
     def find_3_positive(self, p, targets):
         # Build targets for compute_loss(), input targets(image,class,x,y,w,h)
@@ -818,6 +840,7 @@ class ComputeLossOTA:
                 j = torch.max(r, 1. / r).max(2)[0] < self.hyp['anchor_t']  # compare
                 # j = wh_iou(anchors, t[:, 4:6]) > model.hyp['iou_t']  # iou(3,n)=wh_iou(anchors(3,2), gwh(n,2))
                 t = t[j]  # filter
+                t = t.reshape((-1, 7))
 
                 # Offsets
                 gxy = t[:, 2:4]  # grid xy
@@ -1695,3 +1718,34 @@ class ComputeLossAuxOTA:
             anch.append(anchors[a])  # anchors
 
         return indices, anch
+
+
+if __name__ == '__main__':
+    import pickle
+    import yaml
+    from models.yolo import Model
+    with open('p0.pickle', 'rb') as file:
+        p0 = torch.from_numpy(pickle.load(file))
+    with open('p1.pickle', 'rb') as file:
+        p1 = torch.from_numpy(pickle.load(file))
+    with open('p2.pickle', 'rb') as file:
+        p2 = torch.from_numpy(pickle.load(file))
+    with open('imgs.pickle', 'rb') as file:
+        imgs = torch.from_numpy(pickle.load(file))
+    with open('target.pickle', 'rb') as file:
+        targets = torch.from_numpy(pickle.load(file))
+    
+    p = [p0, p1, p2]
+    with open('data/hyp.scratch.p5.yaml') as f:
+        hyp = yaml.load(f, Loader=yaml.SafeLoader)  # load hyps
+    model = Model('cfg/training/yolov7-tiny.yaml', ch=3, nc=80, anchors=None)  # create
+
+    hyp['box'] *= 3. / 3  # scale to layers
+    hyp['cls'] *= 80 / 80. * 3. / 3  # scale to classes and layers
+    hyp['obj'] *= (640 / 640) ** 2 * 3. / 3  # scale to image size and layers
+    model.hyp = hyp  # attach hyperparameters to model
+    model.gr = 1.0  # iou loss ratio (obj_loss = 1.0 or iou)
+
+    compute_loss_ota = ComputeLossOTA(model)  # init loss class
+    # compute_loss_ota.build_targets(p, targets, imgs)
+    compute_loss_ota(p, targets, imgs)
